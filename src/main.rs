@@ -9,9 +9,31 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
-use std::{error::Error, io, process::Command, sync::mpsc, thread, time::Duration};
+use std::{error::Error, io, process::Stdio, time::Duration};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::mpsc;
+
+#[cfg(target_os = "windows")]
+fn build_command(program: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C").arg(program);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_command(program: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new(program);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd
+}
 
 #[derive(Clone)]
 struct Package {
@@ -21,165 +43,147 @@ struct Package {
     selected: bool,
 }
 
-struct ManagerDef {
-    name: &'static str,
-    list_fn: fn() -> Vec<Package>,
-    update_fn: fn(&str) -> Command,
-    delete_fn: fn(&str) -> Command,
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagerType {
+    Winget,
+    Npm,
+    Pnpm,
+    Pip,
+    Uv,
+    Cargo,
+    Choco,
+    Scoop,
+    Gem,
+    Dotnet,
+    Brew,
+    Apt,
+    Pacman,
 }
 
-fn get_managers() -> Vec<ManagerDef> {
-    vec![
-        ManagerDef {
-            name: "winget",
-            list_fn: list_winget,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "winget", "upgrade", pkg]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "winget", "uninstall", pkg]);
-                c
-            },
-        },
-        ManagerDef {
-            name: "npm",
-            list_fn: list_npm,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "npm", "update", "-g", pkg]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "npm", "uninstall", "-g", pkg]);
-                c
-            },
-        },
-        ManagerDef {
-            name: "pnpm",
-            list_fn: list_pnpm,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "pnpm", "update", "-g", pkg]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "pnpm", "remove", "-g", pkg]);
-                c
-            },
-        },
-        ManagerDef {
-            name: "pip",
-            list_fn: list_pip,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "pip", "install", "--upgrade", pkg]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "pip", "uninstall", "-y", pkg]);
-                c
-            },
-        },
-        ManagerDef {
-            name: "uv",
-            list_fn: list_uv,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "uv", "tool", "upgrade", pkg]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "uv", "tool", "uninstall", pkg]);
-                c
-            },
-        },
-        ManagerDef {
-            name: "cargo",
-            list_fn: list_cargo,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "cargo", "install", pkg]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "cargo", "uninstall", pkg]);
-                c
-            },
-        },
-        ManagerDef {
-            name: "choco",
-            list_fn: list_choco,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "choco", "upgrade", pkg, "-y"]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "choco", "uninstall", pkg, "-y"]);
-                c
-            },
-        },
-        ManagerDef {
-            name: "scoop",
-            list_fn: list_scoop,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "scoop", "update", pkg]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "scoop", "uninstall", pkg]);
-                c
-            },
-        },
-        ManagerDef {
-            name: "gem",
-            list_fn: list_gem,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "gem", "update", pkg]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "gem", "uninstall", pkg]);
-                c
-            },
-        },
-        ManagerDef {
-            name: "dotnet",
-            list_fn: list_dotnet,
-            update_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "dotnet", "tool", "update", "-g", pkg]);
-                c
-            },
-            delete_fn: |pkg| {
-                let mut c = Command::new("cmd");
-                c.args(["/C", "dotnet", "tool", "uninstall", "-g", pkg]);
-                c
-            },
-        },
-    ]
+impl ManagerType {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Winget => "winget",
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Pip => "pip",
+            Self::Uv => "uv",
+            Self::Cargo => "cargo",
+            Self::Choco => "choco",
+            Self::Scoop => "scoop",
+            Self::Gem => "gem",
+            Self::Dotnet => "dotnet",
+            Self::Brew => "brew",
+            Self::Apt => "apt",
+            Self::Pacman => "pacman",
+        }
+    }
+
+    fn requires_sudo(&self) -> bool {
+        matches!(self, Self::Apt | Self::Pacman)
+    }
+
+    async fn list_packages(&self) -> Vec<Package> {
+        match self {
+            Self::Npm => list_npm().await,
+            Self::Pnpm => list_pnpm().await,
+            Self::Pip => list_pip().await,
+            Self::Uv => list_uv().await,
+            Self::Cargo => list_cargo().await,
+            Self::Gem => list_gem().await,
+            Self::Dotnet => list_dotnet().await,
+            #[cfg(target_os = "windows")]
+            Self::Winget => list_winget().await,
+            #[cfg(target_os = "windows")]
+            Self::Choco => list_choco().await,
+            #[cfg(target_os = "windows")]
+            Self::Scoop => list_scoop().await,
+            #[cfg(not(target_os = "windows"))]
+            Self::Brew => list_brew().await,
+            #[cfg(not(target_os = "windows"))]
+            Self::Apt => list_apt().await,
+            #[cfg(not(target_os = "windows"))]
+            Self::Pacman => list_pacman().await,
+            _ => vec![],
+        }
+    }
+
+    fn update_command(&self, pkg: &str) -> Command {
+        match self {
+            Self::Npm => build_command("npm", &["update", "-g", pkg]),
+            Self::Pnpm => build_command("pnpm", &["update", "-g", pkg]),
+            Self::Pip => build_command("pip", &["install", "--upgrade", pkg]),
+            Self::Uv => build_command("uv", &["tool", "upgrade", pkg]),
+            Self::Cargo => build_command("cargo", &["install", pkg]),
+            Self::Gem => build_command("gem", &["update", pkg]),
+            Self::Dotnet => build_command("dotnet", &["tool", "update", "-g", pkg]),
+            Self::Winget => build_command("winget", &["upgrade", pkg]),
+            Self::Choco => build_command("choco", &["upgrade", pkg, "-y"]),
+            Self::Scoop => build_command("scoop", &["update", pkg]),
+            Self::Brew => build_command("brew", &["upgrade", pkg]),
+            Self::Apt => build_command(
+                "sudo",
+                &["-n", "apt-get", "--only-upgrade", "install", "-y", pkg],
+            ),
+            Self::Pacman => build_command("sudo", &["-n", "pacman", "-S", "--noconfirm", pkg]),
+        }
+    }
+
+    fn delete_command(&self, pkg: &str) -> Command {
+        match self {
+            Self::Npm => build_command("npm", &["uninstall", "-g", pkg]),
+            Self::Pnpm => build_command("pnpm", &["remove", "-g", pkg]),
+            Self::Pip => build_command("pip", &["uninstall", "-y", pkg]),
+            Self::Uv => build_command("uv", &["tool", "uninstall", pkg]),
+            Self::Cargo => build_command("cargo", &["uninstall", pkg]),
+            Self::Gem => build_command("gem", &["uninstall", pkg]),
+            Self::Dotnet => build_command("dotnet", &["tool", "uninstall", "-g", pkg]),
+            Self::Winget => build_command("winget", &["uninstall", pkg]),
+            Self::Choco => build_command("choco", &["uninstall", pkg, "-y"]),
+            Self::Scoop => build_command("scoop", &["uninstall", pkg]),
+            Self::Brew => build_command("brew", &["uninstall", pkg]),
+            Self::Apt => build_command("sudo", &["-n", "apt-get", "remove", "-y", pkg]),
+            Self::Pacman => build_command("sudo", &["-n", "pacman", "-R", "--noconfirm", pkg]),
+        }
+    }
 }
 
-// -----------------------------------------------------------------------------
-// Parsers
-// -----------------------------------------------------------------------------
+fn get_managers() -> Vec<ManagerType> {
+    let mut m = vec![
+        ManagerType::Npm,
+        ManagerType::Pnpm,
+        ManagerType::Pip,
+        ManagerType::Uv,
+        ManagerType::Cargo,
+        ManagerType::Gem,
+        ManagerType::Dotnet,
+    ];
 
-fn list_winget() -> Vec<Package> {
+    #[cfg(target_os = "windows")]
+    {
+        m.push(ManagerType::Winget);
+        m.push(ManagerType::Choco);
+        m.push(ManagerType::Scoop);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        m.push(ManagerType::Brew);
+        m.push(ManagerType::Apt);
+        m.push(ManagerType::Pacman);
+    }
+    m
+}
+
+// =============================================================================
+// Async Parsers
+// =============================================================================
+
+#[cfg(target_os = "windows")]
+async fn list_winget() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd").args(["/C", "winget", "list"]).output() {
+    if let Ok(out) = build_command("winget", &["list"]).output().await {
         let text = String::from_utf8_lossy(&out.stdout);
         let mut lines = text.lines().skip_while(|l| !l.starts_with("Name"));
         if let Some(header) = lines.next() {
@@ -208,11 +212,11 @@ fn list_winget() -> Vec<Package> {
     pkgs
 }
 
-fn list_npm() -> Vec<Package> {
+async fn list_npm() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd")
-        .args(["/C", "npm", "list", "-g", "--depth=0", "--json"])
+    if let Ok(out) = build_command("npm", &["list", "-g", "--depth=0", "--json"])
         .output()
+        .await
     {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
             if let Some(deps) = json["dependencies"].as_object() {
@@ -231,11 +235,11 @@ fn list_npm() -> Vec<Package> {
     pkgs
 }
 
-fn list_pnpm() -> Vec<Package> {
+async fn list_pnpm() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd")
-        .args(["/C", "pnpm", "ls", "-g", "--depth=0", "--json"])
+    if let Ok(out) = build_command("pnpm", &["ls", "-g", "--depth=0", "--json"])
         .output()
+        .await
     {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
             if let Some(arr) = json.as_array() {
@@ -258,11 +262,11 @@ fn list_pnpm() -> Vec<Package> {
     pkgs
 }
 
-fn list_pip() -> Vec<Package> {
+async fn list_pip() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd")
-        .args(["/C", "pip", "list", "--format=json"])
+    if let Ok(out) = build_command("pip", &["list", "--format=json"])
         .output()
+        .await
     {
         if let Ok(json) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) {
             for v in json {
@@ -280,21 +284,16 @@ fn list_pip() -> Vec<Package> {
     pkgs
 }
 
-fn list_uv() -> Vec<Package> {
+async fn list_uv() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd")
-        .args(["/C", "uv", "tool", "list"])
-        .output()
-    {
+    if let Ok(out) = build_command("uv", &["tool", "list"]).output().await {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
-                let name = parts[0];
-                let version = parts[1].trim_start_matches('v');
                 pkgs.push(Package {
-                    name: name.to_string(),
-                    version: version.to_string(),
+                    name: parts[0].to_string(),
+                    version: parts[1].trim_start_matches('v').to_string(),
                     manager: "uv",
                     selected: false,
                 });
@@ -304,11 +303,11 @@ fn list_uv() -> Vec<Package> {
     pkgs
 }
 
-fn list_cargo() -> Vec<Package> {
+async fn list_cargo() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd")
-        .args(["/C", "cargo", "install", "--list"])
+    if let Ok(out) = build_command("cargo", &["install", "--list"])
         .output()
+        .await
     {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
@@ -328,12 +327,10 @@ fn list_cargo() -> Vec<Package> {
     pkgs
 }
 
-fn list_choco() -> Vec<Package> {
+#[cfg(target_os = "windows")]
+async fn list_choco() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd")
-        .args(["/C", "choco", "list", "-lo"])
-        .output()
-    {
+    if let Ok(out) = build_command("choco", &["list", "-lo"]).output().await {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -353,9 +350,10 @@ fn list_choco() -> Vec<Package> {
     pkgs
 }
 
-fn list_scoop() -> Vec<Package> {
+#[cfg(target_os = "windows")]
+async fn list_scoop() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd").args(["/C", "scoop", "list"]).output() {
+    if let Ok(out) = build_command("scoop", &["list"]).output().await {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines().skip(2) {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -372,11 +370,11 @@ fn list_scoop() -> Vec<Package> {
     pkgs
 }
 
-fn list_dotnet() -> Vec<Package> {
+async fn list_dotnet() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd")
-        .args(["/C", "dotnet", "tool", "list", "-g"])
+    if let Ok(out) = build_command("dotnet", &["tool", "list", "-g"])
         .output()
+        .await
     {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines().skip(2) {
@@ -394,12 +392,9 @@ fn list_dotnet() -> Vec<Package> {
     pkgs
 }
 
-fn list_gem() -> Vec<Package> {
+async fn list_gem() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = Command::new("cmd")
-        .args(["/C", "gem", "list", "--local"])
-        .output()
-    {
+    if let Ok(out) = build_command("gem", &["list", "--local"]).output().await {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
             if let Some(idx) = line.find(" (") {
@@ -418,18 +413,91 @@ fn list_gem() -> Vec<Package> {
     pkgs
 }
 
-// -----------------------------------------------------------------------------
-// App State
-// -----------------------------------------------------------------------------
+#[cfg(not(target_os = "windows"))]
+async fn list_brew() -> Vec<Package> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("brew", &["list", "--versions"])
+        .output()
+        .await
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                pkgs.push(Package {
+                    name: parts[0].to_string(),
+                    version: parts[1].to_string(),
+                    manager: "brew",
+                    selected: false,
+                });
+            }
+        }
+    }
+    pkgs
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn list_apt() -> Vec<Package> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("apt", &["list", "--installed"])
+        .output()
+        .await
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines().skip(1) {
+            if let Some(idx) = line.find('/') {
+                let name = &line[..idx];
+                if let Some(space_idx) = line.find(' ') {
+                    let version_part = &line[space_idx..];
+                    let version = version_part.split_whitespace().next().unwrap_or("unknown");
+                    pkgs.push(Package {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                        manager: "apt",
+                        selected: false,
+                    });
+                }
+            }
+        }
+    }
+    pkgs
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn list_pacman() -> Vec<Package> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("pacman", &["-Qe"]).output().await {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                pkgs.push(Package {
+                    name: parts[0].to_string(),
+                    version: parts[1].to_string(),
+                    manager: "pacman",
+                    selected: false,
+                });
+            }
+        }
+    }
+    pkgs
+}
+
+// =============================================================================
+// App State & Event Loop
+// =============================================================================
 
 enum AppEvent {
     ManagerLoaded(&'static str, Vec<Package>),
+    LogLine(String),
+    OperationFinished,
 }
 
 #[derive(PartialEq)]
 enum ViewState {
     Managers,
-    Packages(usize), // index of the manager in `app.managers`
+    Packages(usize),
+    Logs,
 }
 
 struct ManagerState {
@@ -443,25 +511,28 @@ struct App {
     managers_state: ListState,
     packages_state: ListState,
     view_state: ViewState,
-    rx: mpsc::Receiver<AppEvent>,
+    logs: Vec<String>,
+    logs_scroll: u16,
+    rx: mpsc::UnboundedReceiver<AppEvent>,
 }
 
 impl App {
-    fn new(rx: mpsc::Receiver<AppEvent>) -> App {
+    fn new(rx: mpsc::UnboundedReceiver<AppEvent>) -> App {
         let mut managers = Vec::new();
         for m in get_managers() {
             managers.push(ManagerState {
-                name: m.name,
+                name: m.name(),
                 loading: true,
                 packages: vec![],
             });
         }
-
         let mut app = App {
             managers,
             managers_state: ListState::default(),
             packages_state: ListState::default(),
             view_state: ViewState::Managers,
+            logs: vec![],
+            logs_scroll: 0,
             rx,
         };
         app.managers_state.select(Some(0));
@@ -471,105 +542,97 @@ impl App {
     fn loading_count(&self) -> usize {
         self.managers.iter().filter(|m| m.loading).count()
     }
-
-    fn next(&mut self) {
-        match self.view_state {
-            ViewState::Managers => {
-                let i = match self.managers_state.selected() {
-                    Some(i) => {
-                        if i >= self.managers.len() - 1 {
-                            0
-                        } else {
-                            i + 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.managers_state.select(Some(i));
-            }
-            ViewState::Packages(idx) => {
-                let count = self.managers[idx].packages.len();
-                if count == 0 {
-                    return;
-                }
-                let i = match self.packages_state.selected() {
-                    Some(i) => {
-                        if i >= count - 1 {
-                            0
-                        } else {
-                            i + 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.packages_state.select(Some(i));
-            }
-        }
-    }
-
-    fn previous(&mut self) {
-        match self.view_state {
-            ViewState::Managers => {
-                let i = match self.managers_state.selected() {
-                    Some(i) => {
-                        if i == 0 {
-                            self.managers.len() - 1
-                        } else {
-                            i - 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.managers_state.select(Some(i));
-            }
-            ViewState::Packages(idx) => {
-                let count = self.managers[idx].packages.len();
-                if count == 0 {
-                    return;
-                }
-                let i = match self.packages_state.selected() {
-                    Some(i) => {
-                        if i == 0 {
-                            count - 1
-                        } else {
-                            i - 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.packages_state.select(Some(i));
-            }
-        }
-    }
-
-    fn toggle_selection(&mut self) {
-        if let ViewState::Packages(idx) = self.view_state {
-            if let Some(i) = self.packages_state.selected() {
-                if i < self.managers[idx].packages.len() {
-                    self.managers[idx].packages[i].selected =
-                        !self.managers[idx].packages[i].selected;
-                }
-            }
-        }
-    }
 }
 
-enum RunAction {
-    Update(Vec<Package>),
-    Delete(Vec<Package>),
-    Quit,
+async fn run_operations(
+    tx: mpsc::UnboundedSender<AppEvent>,
+    packages: Vec<Package>,
+    is_update: bool,
+) {
+    let managers = get_managers();
+    for pkg in packages {
+        let _ = tx.send(AppEvent::LogLine(format!(
+            "========================================"
+        )));
+        let action = if is_update {
+            "Updating"
+        } else {
+            "Uninstalling"
+        };
+        let _ = tx.send(AppEvent::LogLine(format!(
+            "{} {} via {}...",
+            action, pkg.name, pkg.manager
+        )));
+
+        if let Some(m_type) = managers.iter().find(|m| m.name() == pkg.manager) {
+            if m_type.requires_sudo() {
+                let _ = tx.send(AppEvent::LogLine(format!(
+                    "WARNING: {} requires sudo privileges. Using 'sudo -n' (will fail if password prompt is needed).",
+                    pkg.manager
+                )));
+            }
+
+            let mut cmd = if is_update {
+                m_type.update_command(&pkg.name)
+            } else {
+                m_type.delete_command(&pkg.name)
+            };
+
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let stdout = child.stdout.take();
+                    let stderr = child.stderr.take();
+                    let tx_out = tx.clone();
+                    let tx_err = tx.clone();
+
+                    let j1 = tokio::spawn(async move {
+                        if let Some(out) = stdout {
+                            let mut reader = BufReader::new(out).lines();
+                            while let Ok(Some(line)) = reader.next_line().await {
+                                let _ = tx_out.send(AppEvent::LogLine(line));
+                            }
+                        }
+                    });
+
+                    let j2 = tokio::spawn(async move {
+                        if let Some(err) = stderr {
+                            let mut reader = BufReader::new(err).lines();
+                            while let Ok(Some(line)) = reader.next_line().await {
+                                let _ = tx_err.send(AppEvent::LogLine(format!("ERROR: {}", line)));
+                            }
+                        }
+                    });
+
+                    let _ = tokio::join!(j1, j2);
+                    let _ = child.wait().await;
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::LogLine(format!("Failed to start command: {}", e)));
+                }
+            }
+        }
+    }
+    let _ = tx.send(AppEvent::LogLine(format!(
+        "========================================"
+    )));
+    let _ = tx.send(AppEvent::LogLine(format!(
+        "Operations complete. Press 'Esc' to return to dashboard."
+    )));
+    let _ = tx.send(AppEvent::OperationFinished);
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let (tx, rx) = mpsc::channel();
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let (tx, rx) = mpsc::unbounded_channel();
 
-    // Spawn threads for all managers
     for manager in get_managers() {
         let tx_clone = tx.clone();
-        thread::spawn(move || {
-            let mut pkgs = (manager.list_fn)();
+        tokio::spawn(async move {
+            let mut pkgs = manager.list_packages().await;
             pkgs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-            let _ = tx_clone.send(AppEvent::ManagerLoaded(manager.name, pkgs));
+            let _ = tx_clone.send(AppEvent::ManagerLoaded(manager.name(), pkgs));
         });
     }
 
@@ -580,65 +643,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(rx);
-    let action = run_app(&mut terminal, &mut app)?;
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    let defs = get_managers();
-
-    match action {
-        RunAction::Update(selected) => {
-            println!("Starting updates for {} packages...", selected.len());
-            for pkg in selected {
-                println!("========================================");
-                println!("Updating {} via {}...", pkg.name, pkg.manager);
-                if let Some(def) = defs.iter().find(|d| d.name == pkg.manager) {
-                    let child = (def.update_fn)(&pkg.name).spawn();
-                    if let Ok(mut c) = child {
-                        let _ = c.wait();
-                    } else {
-                        println!("Failed to start update for {}", pkg.name);
-                    }
-                }
-            }
-            println!("========================================");
-            println!("All updates finished!");
-        }
-        RunAction::Delete(selected) => {
-            println!("Starting deletion for {} packages...", selected.len());
-            for pkg in selected {
-                println!("========================================");
-                println!("Uninstalling {} via {}...", pkg.name, pkg.manager);
-                if let Some(def) = defs.iter().find(|d| d.name == pkg.manager) {
-                    let child = (def.delete_fn)(&pkg.name).spawn();
-                    if let Ok(mut c) = child {
-                        let _ = c.wait();
-                    } else {
-                        println!("Failed to start uninstall for {}", pkg.name);
-                    }
-                }
-            }
-            println!("========================================");
-            println!("All deletions finished!");
-        }
-        RunAction::Quit => {
-            println!("Satellite CLI exiting.");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> io::Result<RunAction> {
     loop {
         while let Ok(event) = app.rx.try_recv() {
             match event {
@@ -648,45 +653,124 @@ fn run_app(
                         mgr.loading = false;
                     }
                 }
+                AppEvent::LogLine(line) => {
+                    app.logs.push(line);
+                    if app.logs.len() > 10 {
+                        app.logs_scroll = (app.logs.len() - 10) as u16;
+                    }
+                }
+                AppEvent::OperationFinished => {}
             }
         }
 
-        terminal.draw(|f| ui(f, app))?;
+        terminal.draw(|f| ui(f, &mut app))?;
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == event::KeyEventKind::Press {
                     match key.code {
-                        KeyCode::Char('q') => return Ok(RunAction::Quit),
+                        KeyCode::Char('q') => {
+                            if app.view_state != ViewState::Logs {
+                                break;
+                            }
+                        }
                         KeyCode::Esc | KeyCode::Backspace => {
-                            if let ViewState::Packages(idx) = app.view_state {
+                            if app.view_state == ViewState::Logs {
+                                app.view_state = ViewState::Managers;
+                                app.logs.clear();
+                                app.logs_scroll = 0;
+                            } else if let ViewState::Packages(idx) = app.view_state {
                                 app.view_state = ViewState::Managers;
                                 for pkg in &mut app.managers[idx].packages {
                                     pkg.selected = false;
                                 }
                             } else {
-                                return Ok(RunAction::Quit);
+                                break;
                             }
                         }
-                        KeyCode::Down | KeyCode::Char('j') => app.next(),
-                        KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                        KeyCode::Char(' ') => app.toggle_selection(),
+                        KeyCode::Down | KeyCode::Char('j') => match app.view_state {
+                            ViewState::Managers => {
+                                if let Some(i) = app.managers_state.selected() {
+                                    app.managers_state.select(Some(
+                                        if i >= app.managers.len() - 1 {
+                                            0
+                                        } else {
+                                            i + 1
+                                        },
+                                    ));
+                                } else {
+                                    app.managers_state.select(Some(0));
+                                }
+                            }
+                            ViewState::Packages(idx) => {
+                                let count = app.managers[idx].packages.len();
+                                if count > 0 {
+                                    if let Some(i) = app.packages_state.selected() {
+                                        app.packages_state.select(Some(if i >= count - 1 {
+                                            0
+                                        } else {
+                                            i + 1
+                                        }));
+                                    } else {
+                                        app.packages_state.select(Some(0));
+                                    }
+                                }
+                            }
+                            ViewState::Logs => {
+                                app.logs_scroll = app.logs_scroll.saturating_add(1);
+                            }
+                        },
+                        KeyCode::Up | KeyCode::Char('k') => match app.view_state {
+                            ViewState::Managers => {
+                                if let Some(i) = app.managers_state.selected() {
+                                    app.managers_state.select(Some(if i == 0 {
+                                        app.managers.len() - 1
+                                    } else {
+                                        i - 1
+                                    }));
+                                } else {
+                                    app.managers_state.select(Some(0));
+                                }
+                            }
+                            ViewState::Packages(idx) => {
+                                let count = app.managers[idx].packages.len();
+                                if count > 0 {
+                                    if let Some(i) = app.packages_state.selected() {
+                                        app.packages_state.select(Some(if i == 0 {
+                                            count - 1
+                                        } else {
+                                            i - 1
+                                        }));
+                                    } else {
+                                        app.packages_state.select(Some(0));
+                                    }
+                                }
+                            }
+                            ViewState::Logs => {
+                                app.logs_scroll = app.logs_scroll.saturating_sub(1);
+                            }
+                        },
+                        KeyCode::Char(' ') => {
+                            if let ViewState::Packages(idx) = app.view_state {
+                                if let Some(i) = app.packages_state.selected() {
+                                    if i < app.managers[idx].packages.len() {
+                                        app.managers[idx].packages[i].selected =
+                                            !app.managers[idx].packages[i].selected;
+                                    }
+                                }
+                            }
+                        }
                         KeyCode::Enter => {
-                            if app.loading_count() > 0 && app.view_state == ViewState::Managers {
+                            if app.view_state == ViewState::Managers {
                                 if let Some(i) = app.managers_state.selected() {
                                     if !app.managers[i].loading {
                                         app.view_state = ViewState::Packages(i);
                                         app.packages_state.select(Some(0));
                                     }
                                 }
-                            } else if app.view_state == ViewState::Managers {
-                                if let Some(i) = app.managers_state.selected() {
-                                    app.view_state = ViewState::Packages(i);
-                                    app.packages_state.select(Some(0));
-                                }
                             }
                         }
-                        KeyCode::Char('u') => {
+                        KeyCode::Char('u') | KeyCode::Char('d') => {
                             if let ViewState::Packages(idx) = app.view_state {
                                 let selected: Vec<_> = app.managers[idx]
                                     .packages
@@ -695,20 +779,12 @@ fn run_app(
                                     .cloned()
                                     .collect();
                                 if !selected.is_empty() {
-                                    return Ok(RunAction::Update(selected));
-                                }
-                            }
-                        }
-                        KeyCode::Char('d') => {
-                            if let ViewState::Packages(idx) = app.view_state {
-                                let selected: Vec<_> = app.managers[idx]
-                                    .packages
-                                    .iter()
-                                    .filter(|p| p.selected)
-                                    .cloned()
-                                    .collect();
-                                if !selected.is_empty() {
-                                    return Ok(RunAction::Delete(selected));
+                                    app.view_state = ViewState::Logs;
+                                    let tx_clone = tx.clone();
+                                    let is_update = key.code == KeyCode::Char('u');
+                                    tokio::spawn(async move {
+                                        run_operations(tx_clone, selected, is_update).await;
+                                    });
                                 }
                             }
                         }
@@ -718,6 +794,15 @@ fn run_app(
             }
         }
     }
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    Ok(())
 }
 
 fn ui(f: &mut ratatui::Frame, app: &mut App) {
@@ -755,15 +840,18 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 .managers
                 .iter()
                 .map(|m| {
-                    let count_str = if m.loading {
-                        "...".to_string()
+                    let (count_str, loading_style) = if m.loading {
+                        ("...".to_string(), Style::default().fg(Color::DarkGray))
+                    } else if m.packages.is_empty() {
+                        (
+                            "[Not Installed]".to_string(),
+                            Style::default().fg(Color::Red),
+                        )
                     } else {
-                        m.packages.len().to_string()
-                    };
-                    let loading_style = if m.loading {
-                        Style::default().fg(Color::DarkGray)
-                    } else {
-                        Style::default().fg(Color::Green)
+                        (
+                            format!("{} packages", m.packages.len()),
+                            Style::default().fg(Color::Green),
+                        )
                     };
 
                     ListItem::new(Line::from(vec![
@@ -773,7 +861,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(format!("{} packages", count_str), loading_style),
+                        Span::styled(count_str, loading_style),
                     ]))
                 })
                 .collect();
@@ -798,58 +886,54 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
             f.render_widget(help, chunks[2]);
         }
         ViewState::Packages(idx) => {
-            let mgr = &app.managers[idx];
-            let items: Vec<ListItem> = mgr
+            let items: Vec<ListItem> = app.managers[idx]
                 .packages
                 .iter()
                 .map(|p| {
-                    let checkbox = if p.selected { "[x]" } else { "[ ]" };
-                    let name_style = if p.selected {
-                        Style::default().fg(Color::Green)
+                    let prefix = if p.selected { "[X]" } else { "[ ]" };
+                    let style = if p.selected {
+                        Style::default().fg(Color::LightGreen)
                     } else {
                         Style::default()
                     };
-
                     ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("{} ", checkbox),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            format!("{:<30}", p.name),
-                            name_style.add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(format!("v{}", p.version)),
+                        Span::styled(format!("{} {:<30} ", prefix, p.name), style),
+                        Span::styled(p.version.clone(), Style::default().fg(Color::DarkGray)),
                     ]))
                 })
                 .collect();
 
-            let block_title = format!("{} Packages", mgr.name);
-            if items.is_empty() {
-                let empty = Paragraph::new(if mgr.loading {
-                    "Loading..."
-                } else {
-                    "No packages found for this manager."
-                })
-                .block(Block::default().borders(Borders::ALL).title(block_title));
-                f.render_widget(empty, chunks[1]);
-            } else {
-                let list = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(block_title))
-                    .highlight_style(
-                        Style::default()
-                            .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .highlight_symbol(">> ");
-                f.render_stateful_widget(list, chunks[1], &mut app.packages_state);
-            }
+            let title = format!("{} Packages", app.managers[idx].name);
+            let list = List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol(">> ");
+            f.render_stateful_widget(list, chunks[1], &mut app.packages_state);
 
-            let help = Paragraph::new(
-                "Esc/Backspace: Back | Space: Select | u: Update Selected | d: Delete Selected",
-            )
-            .style(Style::default().fg(Color::Gray))
-            .block(Block::default().borders(Borders::ALL));
+            let help = Paragraph::new("Space: Select | u: Update | d: Delete | Esc: Back")
+                .style(Style::default().fg(Color::Gray))
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(help, chunks[2]);
+        }
+        ViewState::Logs => {
+            let text: Vec<Line> = app.logs.iter().map(|l| Line::from(l.clone())).collect();
+            let p = Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Operation Logs"),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((app.logs_scroll, 0));
+            f.render_widget(p, chunks[1]);
+
+            let help = Paragraph::new("j/k: Scroll | Esc: Back to Dashboard")
+                .style(Style::default().fg(Color::Gray))
+                .block(Block::default().borders(Borders::ALL));
             f.render_widget(help, chunks[2]);
         }
     }

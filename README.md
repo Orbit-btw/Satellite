@@ -5,13 +5,14 @@
 If you are setting up a new machine, managing a sprawling dev environment, or just keeping your global tools up to date, Satellite makes it frictionless.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+![Platform](https://img.shields.io/badge/platform-Cross--Platform-lightgrey.svg)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg)
 
 ## 🚀 Features
 
-- **Universal Support**: Seamlessly reads and executes updates for `winget`, `npm`, `pnpm`, `pip`, `uv`, `cargo`, `choco`, `scoop`, `gem`, and `dotnet`.
-- **Blazing Fast Concurrent Fetching**: Uses multi-threading to scan all 10 package managers concurrently the exact millisecond the app opens, preventing UI blocking.
+- **Universal Support**: Seamlessly reads and executes updates for `winget`, `npm`, `pnpm`, `pip`, `uv`, `cargo`, `choco`, `scoop`, `gem`, `dotnet`, `brew`, `apt`, and `pacman`.
+- **Blazing Fast Concurrent Fetching**: Uses multi-threading to scan all package managers concurrently the exact millisecond the app opens, preventing UI blocking.
+- **Cross-Platform**: Automatically detects your OS and only loads the package managers relevant to your system (e.g. `winget` on Windows, `apt` on Linux).
 - **Two-Tier Dashboard**: 
   - *Tier 1*: See all supported ecosystems and exactly how many packages you have installed in each.
   - *Tier 2*: Dive into an ecosystem, view versions, and batch-select packages to manage.
@@ -54,7 +55,7 @@ sat
 
 ## 📦 Supported Package Managers
 
-| Package Manager | Language / Ecosystem | Windows Execution Strategy |
+| Package Manager | Language / Ecosystem | Native Execution Strategy |
 | --------------- | -------------------- | ------------------------- |
 | **Winget**      | Windows Native       | `winget list`             |
 | **Pip**         | Python               | `pip list --format=json`  |
@@ -66,11 +67,14 @@ sat
 | **Scoop**       | Windows Env          | `scoop list`              |
 | **Gem**         | Ruby                 | `gem list --local`        |
 | **Dotnet**      | .NET Global Tools    | `dotnet tool list -g`     |
+| **Brew**        | macOS / Linux        | `brew list --versions`    |
+| **APT**         | Debian / Ubuntu      | `apt list --installed`    |
+| **Pacman**      | Arch Linux           | `pacman -Qe`              |
 
-*(Note: Package manager binaries are wrapped in `cmd /C` execution threads to guarantee path resolution on Windows environments).*
+*(Note: Package manager binaries execute natively on Unix and gracefully fallback to `cmd /C` execution wrappers on Windows environments).*
 
 ## 🤝 Contributing
-Contributions are always welcome! Feel free to open issues or submit PRs to add support for missing package managers (like `apt`, `brew`, or `go modules`) or UI enhancements.
+Contributions are always welcome! Feel free to open issues or submit PRs to add support for missing package managers or UI enhancements.
 
 ## 📜 License
 This project is licensed under the MIT License.
