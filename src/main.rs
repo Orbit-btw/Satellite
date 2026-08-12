@@ -39,6 +39,7 @@ fn build_command(program: &str, args: &[&str]) -> Command {
 struct Package {
     name: String,
     version: String,
+    latest_version: Option<String>,
     manager: &'static str,
     selected: bool,
 }
@@ -105,6 +106,28 @@ impl ManagerType {
             Self::Apt => list_apt().await,
             #[cfg(not(target_os = "windows"))]
             Self::Pacman => list_pacman().await,
+            _ => vec![],
+        }
+    }
+
+    async fn list_outdated(&self) -> Vec<(String, String)> {
+        match self {
+            Self::Npm => outdated_npm().await,
+            Self::Pnpm => outdated_pnpm().await,
+            Self::Pip => outdated_pip().await,
+            Self::Gem => outdated_gem().await,
+            #[cfg(target_os = "windows")]
+            Self::Winget => outdated_winget().await,
+            #[cfg(target_os = "windows")]
+            Self::Choco => outdated_choco().await,
+            #[cfg(target_os = "windows")]
+            Self::Scoop => outdated_scoop().await,
+            #[cfg(not(target_os = "windows"))]
+            Self::Brew => outdated_brew().await,
+            #[cfg(not(target_os = "windows"))]
+            Self::Apt => outdated_apt().await,
+            #[cfg(not(target_os = "windows"))]
+            Self::Pacman => outdated_pacman().await,
             _ => vec![],
         }
     }
@@ -180,10 +203,198 @@ fn get_managers() -> Vec<ManagerType> {
 // Async Parsers
 // =============================================================================
 
+async fn outdated_gem() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("gem", &["outdated"]).output().await {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if let Some(idx) = line.find(" (") {
+                let name = &line[..idx];
+                if let Some(less_idx) = line.find("< ") {
+                    let latest_part = &line[less_idx + 2..line.len() - 1];
+                    let latest = latest_part.split(", ").next().unwrap_or(latest_part);
+                    pkgs.push((name.to_string(), latest.to_string()));
+                }
+            }
+        }
+    }
+    pkgs
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn outdated_brew() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("brew", &["outdated"]).output().await {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if !parts.is_empty() {
+                if let Some(idx) = parts.iter().position(|&x| x == "<") {
+                    if idx + 1 < parts.len() {
+                        pkgs.push((parts[0].to_string(), parts[idx + 1].to_string()));
+                    }
+                }
+            }
+        }
+    }
+    pkgs
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn outdated_apt() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("apt", &["list", "--upgradable"]).output().await {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines().skip(1) {
+            if let Some(idx) = line.find('/') {
+                let name = &line[..idx];
+                if let Some(space_idx) = line.find(' ') {
+                    let version_part = line[space_idx..].trim();
+                    let latest = version_part.split_whitespace().next().unwrap_or("unknown");
+                    pkgs.push((name.to_string(), latest.to_string()));
+                }
+            }
+        }
+    }
+    pkgs
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn outdated_pacman() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("pacman", &["-Qu"]).output().await {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 && parts[2] == "->" {
+                pkgs.push((parts[0].to_string(), parts[3].to_string()));
+            }
+        }
+    }
+    pkgs
+}
+
+async fn outdated_npm() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("npm", &["outdated", "-g", "--json"])
+        .output()
+        .await
+    {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+            if let Some(obj) = json.as_object() {
+                for (k, v) in obj {
+                    if let Some(latest) = v["latest"].as_str() {
+                        pkgs.push((k.clone(), latest.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    pkgs
+}
+
+async fn outdated_pnpm() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("pnpm", &["outdated", "-g", "--json"])
+        .output()
+        .await
+    {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+            if let Some(obj) = json.as_object() {
+                for (k, v) in obj {
+                    if let Some(latest) = v["latest"].as_str() {
+                        pkgs.push((k.clone(), latest.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    pkgs
+}
+
+async fn outdated_pip() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("pip", &["list", "--outdated", "--format=json"])
+        .output()
+        .await
+    {
+        if let Ok(json) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) {
+            for v in json {
+                if let (Some(n), Some(latest)) = (v["name"].as_str(), v["latest_version"].as_str())
+                {
+                    pkgs.push((n.to_string(), latest.to_string()));
+                }
+            }
+        }
+    }
+    pkgs
+}
+
+#[cfg(target_os = "windows")]
+async fn outdated_winget() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("winget", &["upgrade", "--accept-source-agreements"]).output().await {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines().skip_while(|l| !l.starts_with("Name"));
+        if let Some(header) = lines.next() {
+            let id_idx = header.find("Id").unwrap_or(0);
+            let avail_idx = header.find("Available").unwrap_or(0);
+            for line in lines.skip(1) {
+                if line.len() > avail_idx {
+                    let id = line[id_idx..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let available = line[avail_idx..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    if !id.is_empty() && !available.is_empty() && !id.contains(" ") && id != "Id" {
+                        pkgs.push((id, available));
+                    }
+                }
+            }
+        }
+    }
+    pkgs
+}
+
+#[cfg(target_os = "windows")]
+async fn outdated_choco() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("choco", &["outdated"]).output().await {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() >= 3 {
+                pkgs.push((parts[0].to_string(), parts[2].to_string()));
+            }
+        }
+    }
+    pkgs
+}
+
+#[cfg(target_os = "windows")]
+async fn outdated_scoop() -> Vec<(String, String)> {
+    let mut pkgs = vec![];
+    if let Ok(out) = build_command("scoop", &["status"]).output().await {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines().skip_while(|l| !l.starts_with("----")).skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                pkgs.push((parts[0].to_string(), parts[2].to_string()));
+            }
+        }
+    }
+    pkgs
+}
+
 #[cfg(target_os = "windows")]
 async fn list_winget() -> Vec<Package> {
     let mut pkgs = vec![];
-    if let Ok(out) = build_command("winget", &["list"]).output().await {
+    if let Ok(out) = build_command("winget", &["list", "--accept-source-agreements"]).output().await {
         let text = String::from_utf8_lossy(&out.stdout);
         let mut lines = text.lines().skip_while(|l| !l.starts_with("Name"));
         if let Some(header) = lines.next() {
@@ -201,6 +412,7 @@ async fn list_winget() -> Vec<Package> {
                         pkgs.push(Package {
                             name: id,
                             version: ver,
+                            latest_version: None,
                             manager: "winget",
                             selected: false,
                         });
@@ -225,6 +437,7 @@ async fn list_npm() -> Vec<Package> {
                     pkgs.push(Package {
                         name: k.clone(),
                         version: ver.to_string(),
+                        latest_version: None,
                         manager: "npm",
                         selected: false,
                     });
@@ -250,6 +463,7 @@ async fn list_pnpm() -> Vec<Package> {
                             pkgs.push(Package {
                                 name: k.clone(),
                                 version: ver.to_string(),
+                                latest_version: None,
                                 manager: "pnpm",
                                 selected: false,
                             });
@@ -274,6 +488,7 @@ async fn list_pip() -> Vec<Package> {
                     pkgs.push(Package {
                         name: n.to_string(),
                         version: ver.to_string(),
+                        latest_version: None,
                         manager: "pip",
                         selected: false,
                     });
@@ -294,6 +509,7 @@ async fn list_uv() -> Vec<Package> {
                 pkgs.push(Package {
                     name: parts[0].to_string(),
                     version: parts[1].trim_start_matches('v').to_string(),
+                    latest_version: None,
                     manager: "uv",
                     selected: false,
                 });
@@ -317,6 +533,7 @@ async fn list_cargo() -> Vec<Package> {
                     pkgs.push(Package {
                         name: parts[0].to_string(),
                         version: parts[1].trim_start_matches('v').to_string(),
+                        latest_version: None,
                         manager: "cargo",
                         selected: false,
                     });
@@ -341,6 +558,7 @@ async fn list_choco() -> Vec<Package> {
                 pkgs.push(Package {
                     name: parts[0].to_string(),
                     version: parts[1].to_string(),
+                    latest_version: None,
                     manager: "choco",
                     selected: false,
                 });
@@ -361,6 +579,7 @@ async fn list_scoop() -> Vec<Package> {
                 pkgs.push(Package {
                     name: parts[0].to_string(),
                     version: parts[1].to_string(),
+                    latest_version: None,
                     manager: "scoop",
                     selected: false,
                 });
@@ -383,6 +602,7 @@ async fn list_dotnet() -> Vec<Package> {
                 pkgs.push(Package {
                     name: parts[0].to_string(),
                     version: parts[1].to_string(),
+                    latest_version: None,
                     manager: "dotnet",
                     selected: false,
                 });
@@ -404,6 +624,7 @@ async fn list_gem() -> Vec<Package> {
                 pkgs.push(Package {
                     name: name.to_string(),
                     version: version.to_string(),
+                    latest_version: None,
                     manager: "gem",
                     selected: false,
                 });
@@ -427,6 +648,7 @@ async fn list_brew() -> Vec<Package> {
                 pkgs.push(Package {
                     name: parts[0].to_string(),
                     version: parts[1].to_string(),
+                    latest_version: None,
                     manager: "brew",
                     selected: false,
                 });
@@ -453,6 +675,7 @@ async fn list_apt() -> Vec<Package> {
                     pkgs.push(Package {
                         name: name.to_string(),
                         version: version.to_string(),
+                        latest_version: None,
                         manager: "apt",
                         selected: false,
                     });
@@ -474,6 +697,7 @@ async fn list_pacman() -> Vec<Package> {
                 pkgs.push(Package {
                     name: parts[0].to_string(),
                     version: parts[1].to_string(),
+                    latest_version: None,
                     manager: "pacman",
                     selected: false,
                 });
@@ -489,8 +713,9 @@ async fn list_pacman() -> Vec<Package> {
 
 enum AppEvent {
     ManagerLoaded(&'static str, Vec<Package>),
+    OutdatedLoaded(&'static str, Vec<(String, String)>),
     LogLine(String),
-    OperationFinished,
+    OperationFinished(bool, Vec<Package>),
 }
 
 #[derive(PartialEq)]
@@ -550,7 +775,7 @@ async fn run_operations(
     is_update: bool,
 ) {
     let managers = get_managers();
-    for pkg in packages {
+    for pkg in &packages {
         let _ = tx.send(AppEvent::LogLine(format!(
             "========================================"
         )));
@@ -620,7 +845,7 @@ async fn run_operations(
     let _ = tx.send(AppEvent::LogLine(format!(
         "Operations complete. Press 'Esc' to return to dashboard."
     )));
-    let _ = tx.send(AppEvent::OperationFinished);
+    let _ = tx.send(AppEvent::OperationFinished(is_update, packages));
 }
 
 #[tokio::main]
@@ -629,10 +854,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     for manager in get_managers() {
         let tx_clone = tx.clone();
+        let tx_outdated = tx.clone();
         tokio::spawn(async move {
             let mut pkgs = manager.list_packages().await;
             pkgs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
             let _ = tx_clone.send(AppEvent::ManagerLoaded(manager.name(), pkgs));
+
+            let outdated = manager.list_outdated().await;
+            let _ = tx_outdated.send(AppEvent::OutdatedLoaded(manager.name(), outdated));
         });
     }
 
@@ -653,13 +882,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         mgr.loading = false;
                     }
                 }
+                AppEvent::OutdatedLoaded(name, outdated) => {
+                    if let Some(mgr) = app.managers.iter_mut().find(|m| m.name == name) {
+                        for (pkg_name, latest_ver) in outdated {
+                            if let Some(p) = mgr.packages.iter_mut().find(|p| p.name.trim().eq_ignore_ascii_case(pkg_name.trim())) {
+                                p.latest_version = Some(latest_ver.trim().to_string());
+                            }
+                        }
+                    }
+                }
                 AppEvent::LogLine(line) => {
                     app.logs.push(line);
                     if app.logs.len() > 10 {
                         app.logs_scroll = (app.logs.len() - 10) as u16;
                     }
                 }
-                AppEvent::OperationFinished => {}
+                AppEvent::OperationFinished(is_update, pkgs) => {
+                    for p in pkgs {
+                        if let Some(mgr) = app.managers.iter_mut().find(|m| m.name == p.manager) {
+                            if is_update {
+                                if let Some(pkg) = mgr.packages.iter_mut().find(|x| x.name == p.name) {
+                                    if let Some(latest) = &pkg.latest_version {
+                                        pkg.version = latest.clone();
+                                    }
+                                    pkg.latest_version = None;
+                                    pkg.selected = false;
+                                }
+                            } else {
+                                mgr.packages.retain(|x| x.name != p.name);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -896,9 +1150,16 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                     } else {
                         Style::default()
                     };
+                    let version_display = p.version.clone();
+                    let update_span = if p.latest_version.is_some() {
+                        Span::styled(" [Update Available]", Style::default().fg(Color::Yellow))
+                    } else {
+                        Span::raw("")
+                    };
                     ListItem::new(Line::from(vec![
                         Span::styled(format!("{} {:<30} ", prefix, p.name), style),
-                        Span::styled(p.version.clone(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(version_display, Style::default().fg(Color::DarkGray)),
+                        update_span,
                     ]))
                 })
                 .collect();
