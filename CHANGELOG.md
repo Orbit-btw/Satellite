@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - Update Checks & UI Automation
+
+### Added
+- **Universal Update Checks**: Added automated update checking capabilities for macOS and Linux native package managers (`apt`, `pacman`, `brew`), as well as `gem`, maintaining parity with Windows features.
+- **Optimistic UI Updates**: Introduced instant UI state updates. Updating or deleting a package now instantly updates the package list without requiring you to restart the CLI.
+- **Visual Update Tags**: The package list view now prominently highlights outdated packages with a yellow `[Update Available]` tag next to the version.
+- **Release Automation**: Overhauled the GitHub Actions pipeline. Pushing a version bump to `Cargo.toml` now automatically generates the tag, compiles cross-platform binaries (Windows, Linux, macOS), and creates a GitHub Release.
+
+### Fixed
+- **Robust String Matching**: Fixed a case-sensitivity and whitespace mismatch bug that prevented package managers (like `winget`) from displaying available updates in the UI.
+- **Silent Winget Freezing**: Fixed an issue where `winget` update checks would silently hang the background threads by waiting for EULA confirmations. Fixed by supplying `--accept-source-agreements`.
+
 ## [0.2.0] - Cross-Platform Update
 
 ### Added
