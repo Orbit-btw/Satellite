@@ -2,14 +2,45 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+    paths:
+      - 'Cargo.toml'
 
 permissions:
   contents: write
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.VERSION }}
+      should_release: ${{ steps.check.outputs.SHOULD_RELEASE }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needed to fetch all tags
+      
+      - name: Get version from Cargo.toml
+        id: get_version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d '"' -f 2)
+          echo "VERSION=v$VERSION" >> $GITHUB_OUTPUT
+          
+      - name: Check if tag exists
+        id: check
+        run: |
+          if git ls-remote --tags origin | grep "refs/tags/${{ steps.get_version.outputs.VERSION }}$" >/dev/null 2>&1; then
+            echo "Version ${{ steps.get_version.outputs.VERSION }} already exists as a tag. Skipping release."
+            echo "SHOULD_RELEASE=false" >> $GITHUB_OUTPUT
+          else
+            echo "Version ${{ steps.get_version.outputs.VERSION }} is new. Creating release!"
+            echo "SHOULD_RELEASE=true" >> $GITHUB_OUTPUT
+          fi
+
   build-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     name: Build release on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -43,5 +74,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.check-version.outputs.version }}
+          name: Release ${{ needs.check-version.outputs.version }}
           files: target/release/${{ matrix.asset_name }}
           generate_release_notes: true
